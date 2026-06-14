@@ -1,0 +1,382 @@
+#include <SoftwareSerial.h>
+#include <EEPROM.h>
+#include <DFRobot_Servo.h>
+#include <DFRobot_Libraries.h>
+
+SoftwareSerial scanner(2, 3);
+Servo doorServo;
+
+// Ultrasonic pins
+#define TRIG_PIN  10
+#define ECHO_PIN  11
+
+// LED pins
+#define RED_LED   4
+#define GREEN_LED 5
+#define BLUE_LED  6
+
+// Buzzer pin
+#define BUZZER_PIN 12
+
+// Servo time (seconds)
+#define SERVO_OPEN_TIME  15
+
+// EEPROM addresses
+#define CODE_COUNT_ADDR    0
+#define CODE_START_ADDR    1
+#define COUNTER_START_ADDR  71
+
+String authorizedCodes[5] = {"5202304219705", "2222222222222", "3333333333333", "4444444444444", "5555555555555"};
+byte scanCounters[5] = {0, 0, 0, 0, 0};
+
+// ============ ΜΕΤΑΒΛΗΤΕΣ ============
+bool ultrasonicPaused = false;
+unsigned long itemPlaceTime = 0;
+bool itemInside = false;
+bool waitingForTimeout = false;
+unsigned long denyRedStartTime = 0;
+bool denyRedActive = false;
+bool doorIsOpen = false;
+
+// ============ ΔΗΛΩΣΕΙΣ ============
+float getDistance();
+bool isBoxEmpty();
+void updateStatusLED();
+int findCodeIndex(String code);
+void saveCodesToEEPROM();
+void loadCountersFromEEPROM();
+void saveCounterToEEPROM(int index, byte value);
+void grantAccess();
+void denyAccess();
+void printStatus();
+void resetAllCounters();
+void startUltrasonic();
+void pauseUltrasonic();
+void checkItemTimeout();
+
+// ============ SETUP ============
+void setup() {
+  scanner.begin(9600);
+  Serial.begin(9600);
+  doorServo.attach(9);
+  doorServo.angle(180);
+  
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(RED_LED, OUTPUT);
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(BLUE_LED, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  
+  digitalWrite(RED_LED, LOW);
+  digitalWrite(GREEN_LED, LOW);
+  digitalWrite(BLUE_LED, HIGH);
+  
+  Serial.println("=== Food Box System ===");
+  Serial.println("Blue = empty | Green = full | Red = 10 sec after door closed (if still full)");
+  
+  if (EEPROM.read(CODE_COUNT_ADDR) != 5) {
+    saveCodesToEEPROM();
+  }
+  
+  resetAllCounters();
+  loadCountersFromEEPROM();
+  printStatus();
+}
+
+// ============ ULTRASONIC CONTROL ============
+void startUltrasonic() {
+  if (ultrasonicPaused) {
+    ultrasonicPaused = false;
+    itemInside = false;
+    waitingForTimeout = false;
+    itemPlaceTime = 0;
+    digitalWrite(BLUE_LED, HIGH);
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(RED_LED, LOW);
+    Serial.println("ULTRASONIC RESUMED - Box empty (Blue LED)");
+  }
+}
+
+void pauseUltrasonic() {
+  if (!ultrasonicPaused && !doorIsOpen) {
+    ultrasonicPaused = true;
+    itemInside = true;
+    waitingForTimeout = true;
+    itemPlaceTime = millis();
+    digitalWrite(BLUE_LED, LOW);
+    digitalWrite(GREEN_LED, HIGH);
+    digitalWrite(RED_LED, LOW);
+    Serial.println("ULTRASONIC PAUSED - Item inside (Green LED). Timer started.");
+  }
+}
+
+void checkItemTimeout() {
+  if (waitingForTimeout && !doorIsOpen) {
+    if (millis() - itemPlaceTime > 10000) {
+      waitingForTimeout = false;
+      digitalWrite(GREEN_LED, LOW);
+      digitalWrite(RED_LED, HIGH);
+      Serial.println("10 seconds passed - RED LED ON (item still inside)");
+    }
+  }
+}
+
+float getDistance() {
+  if (ultrasonicPaused || doorIsOpen) {
+    return ultrasonicPaused ? 5.0 : 50.0;
+  }
+  
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  
+  long duration = pulseIn(ECHO_PIN, HIGH);
+  float distance = duration * 0.034 / 2;
+  
+  // Μόνο αν είναι πολύ κοντά (<4cm) θεωρούμε ότι μπήκε αντικείμενο
+  if (distance < 4.0 && !ultrasonicPaused && !doorIsOpen) {
+    pauseUltrasonic();
+  }
+  
+  return distance;
+}
+
+bool isBoxEmpty() {
+  float dist = getDistance();
+  Serial.print("Ultrasonic distance: ");
+  Serial.print(dist);
+  Serial.println(" cm");
+  
+  // Μεγαλύτερο από 15cm σημαίνει σίγουρα άδειο
+  if (dist > 15.0) {
+    return true;
+  } 
+  // Μικρότερο από 4cm σημαίνει σίγουρα γεμάτο
+  else if (dist < 4.0) {
+    return false;
+  } 
+  else {
+    // Ενδιάμεσο: κράτα προηγούμενη κατάσταση
+    static bool lastState = true;
+    return lastState;
+  }
+}
+
+// ============ LED STATUS ============
+void updateStatusLED() {
+  if (denyRedActive) {
+    if (millis() - denyRedStartTime >= 3000) {
+      denyRedActive = false;
+      digitalWrite(RED_LED, LOW);
+    } else {
+      digitalWrite(RED_LED, HIGH);
+      digitalWrite(GREEN_LED, LOW);
+      digitalWrite(BLUE_LED, LOW);
+      return;
+    }
+  }
+  
+  if (doorIsOpen) {
+    digitalWrite(RED_LED, LOW);
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(BLUE_LED, LOW);
+    return;
+  }
+  
+  if (!waitingForTimeout && ultrasonicPaused && !doorIsOpen) {
+    digitalWrite(RED_LED, HIGH);
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(BLUE_LED, LOW);
+    return;
+  }
+  
+  if (ultrasonicPaused && waitingForTimeout && !doorIsOpen) {
+    digitalWrite(RED_LED, LOW);
+    digitalWrite(GREEN_LED, HIGH);
+    digitalWrite(BLUE_LED, LOW);
+    return;
+  }
+  
+  if (!ultrasonicPaused && !itemInside && !doorIsOpen) {
+    digitalWrite(RED_LED, LOW);
+    digitalWrite(GREEN_LED, LOW);
+    digitalWrite(BLUE_LED, HIGH);
+    return;
+  }
+}
+
+// ============ ΜΗΔΕΝΙΣΜΟΣ ΜΕΤΡΗΤΩΝ ============
+void resetAllCounters() {
+  for (int i = 0; i < 5; i++) {
+    scanCounters[i] = 0;
+    EEPROM.write(COUNTER_START_ADDR + i, 0);
+  }
+  Serial.println("=== ALL COUNTERS RESET TO 0 ===");
+}
+
+// ============ LOOP ============
+void loop() {
+  checkItemTimeout();
+  
+  if (!doorIsOpen && !ultrasonicPaused) {
+    getDistance();
+  }
+  
+  updateStatusLED();
+  
+  if (scanner.available()) {
+    String barcode = scanner.readString();
+    barcode.trim();
+    
+    Serial.print("Scanned: ");
+    Serial.println(barcode);
+    
+    int index = findCodeIndex(barcode);
+    
+    if (index == -1) {
+      Serial.println("ACCESS DENIED: Not authorized");
+      denyAccess();
+    }
+    else if (scanCounters[index] >= 3) {
+      Serial.print("ACCESS DENIED: Already used ");
+      Serial.print(scanCounters[index]);
+      Serial.println(" times (max 3)");
+      denyAccess();
+    }
+    else {
+      if (isBoxEmpty() && !ultrasonicPaused) {
+        Serial.println("ACCESS GRANTED - Empty. Opening for deposit.");
+        grantAccess();
+        scanCounters[index]++;
+        saveCounterToEEPROM(index, scanCounters[index]);
+      } else {
+        Serial.println("ACCESS GRANTED - Occupied. Opening for retrieval.");
+        grantAccess();
+      }
+    }
+    Serial.println("---");
+  }
+  delay(50);
+}
+
+// ============ BARCODE MANAGEMENT ============
+int findCodeIndex(String code) {
+  for (int i = 0; i < 5; i++) {
+    if (authorizedCodes[i] == code) return i;
+  }
+  return -1;
+}
+
+void saveCodesToEEPROM() {
+  EEPROM.write(CODE_COUNT_ADDR, 5);
+  int addr = CODE_START_ADDR;
+  for (int i = 0; i < 5; i++) {
+    int len = authorizedCodes[i].length();
+    EEPROM.write(addr, len);
+    addr++;
+    for (int j = 0; j < len; j++) {
+      EEPROM.write(addr, authorizedCodes[i][j]);
+      addr++;
+    }
+    for (int j = len; j < 14; j++) {
+      EEPROM.write(addr, 0);
+      addr++;
+    }
+  }
+}
+
+void loadCountersFromEEPROM() {
+  for (int i = 0; i < 5; i++) {
+    scanCounters[i] = EEPROM.read(COUNTER_START_ADDR + i);
+  }
+}
+
+void saveCounterToEEPROM(int index, byte value) {
+  EEPROM.write(COUNTER_START_ADDR + index, value);
+}
+
+// ============ ACCESS CONTROL ============
+void grantAccess() {
+  doorIsOpen = true;
+  
+  digitalWrite(RED_LED, LOW);
+  digitalWrite(GREEN_LED, LOW);
+  digitalWrite(BLUE_LED, LOW);
+  
+  doorServo.angle(0);
+  Serial.print("Door opened for ");
+  Serial.print(SERVO_OPEN_TIME);
+  Serial.println(" seconds");
+  
+  tone(BUZZER_PIN, 1000, 200);
+  delay(300);
+  tone(BUZZER_PIN, 1000, 200);
+  
+  delay(SERVO_OPEN_TIME * 1000);
+  
+  doorServo.angle(180);
+  Serial.println("Door closed");
+  tone(BUZZER_PIN, 1000, 300);
+  
+  doorIsOpen = false;
+  
+  // Περιμένουμε 1.5 δευτερόλεπτο να ηρεμήσει η πόρτα
+  delay(1500);
+  
+  // Παίρνουμε 3 μετρήσεις και κρατάμε τη μεγαλύτερη απόσταση
+  float maxDist = 0;
+  for (int i = 0; i < 3; i++) {
+    float d = getDistance();
+    if (d > maxDist) maxDist = d;
+    delay(100);
+  }
+  Serial.print("Max distance after door close: ");
+  Serial.println(maxDist);
+  
+  // Αν η μεγαλύτερη απόσταση > 15 cm, τότε το κουτί είναι άδειο
+  if (maxDist > 15.0) {
+    startUltrasonic();
+    Serial.println("Box is EMPTY - Blue LED");
+  } 
+  else if (maxDist < 4.0) {
+    pauseUltrasonic();
+    Serial.println("Box is FULL - Green LED (timer started)");
+  }
+  else {
+    startUltrasonic();
+    Serial.println("UNCERTAIN - Treating as EMPTY - Blue LED");
+  }
+}
+
+void denyAccess() {
+  digitalWrite(RED_LED, HIGH);
+  digitalWrite(GREEN_LED, LOW);
+  digitalWrite(BLUE_LED, LOW);
+  denyRedActive = true;
+  denyRedStartTime = millis();
+  
+  for (int i = 0; i < 3; i++) {
+    tone(BUZZER_PIN, 800, 200);
+    delay(250);
+    noTone(BUZZER_PIN);
+    delay(250);
+  }
+  
+  Serial.println("Access denied - Red LED for 3 seconds");
+}
+
+void printStatus() {
+  Serial.println("=== Authorized Codes ===");
+  for (int i = 0; i < 5; i++) {
+    Serial.print(i + 1);
+    Serial.print(": ");
+    Serial.print(authorizedCodes[i]);
+    Serial.print(" → used ");
+    Serial.print(scanCounters[i]);
+    Serial.println(" times");
+  }
+  Serial.println("========================");
+}
